@@ -26,6 +26,8 @@ from utils import dataset as dataset_util
 from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
+from utils.lr_schedulers import build_lr_scheduler, fast_forward_lr_scheduler
+from utils.train_debug import install_debug_hook
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
@@ -668,6 +670,16 @@ if __name__ == '__main__':
         args = []
         kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
 
+        # The Muon/AdamW split owns its own config vocabulary (muon_min_size,
+        # adamw_lr, kahan_adamw, adamw_betas, adamw_eps, adamw_weight_decay).
+        # Pop them here, at the single point where kwargs is built, so that
+        # leaving them in a config while selecting a different optimizer can
+        # never raise `TypeError: __init__() got an unexpected keyword argument`.
+        from optimizers.muon_kahan import MUON_SPLIT_KEYS
+        muon_cfg = {k: kwargs.pop(k) for k in MUON_SPLIT_KEYS if k in kwargs}
+        if muon_cfg and optim_type_lower != 'muon_kahan':
+            print(f'Warning: {[k for k in muon_cfg]} are Muon/AdamW-split settings and are ignored by optimizer type {optim_type!r}.')
+
         if optim_type_lower == 'adamw':
             # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
             # when Deepspeed tries to build the fused Adam extension.
@@ -698,6 +710,9 @@ if __name__ == '__main__':
         elif optim_type_lower == 'genericoptim':
             from optimizers import generic_optim
             klass = generic_optim.GenericOptim
+        elif optim_type_lower == 'muon_kahan':
+            from optimizers import muon_kahan
+            klass = muon_kahan.MuonKahan
         else:
             import pytorch_optimizer
             klass = getattr(pytorch_optimizer, optim_type)
@@ -815,10 +830,17 @@ if __name__ == '__main__':
                 new_param_groups.append(pg_no_wd)
         param_groups = new_param_groups
 
+        if optim_type_lower == 'muon_kahan':
+            # Runs AFTER the weight-decay split above, so 1-D params and
+            # llm_adapter.embed keep weight_decay == 0 unless the config asks
+            # for an explicit adamw_weight_decay override.
+            param_groups = muon_kahan.split_param_groups(param_groups, **muon_cfg)
+
         return klass(param_groups, *args, **kwargs)
 
     model_engine._configure_optimizer(get_optimizer, parameters_to_train)
     optimizer = model_engine.optimizer
+    install_debug_hook(optimizer, config, model_engine)
 
     model.model_engine = model_engine
     if model_engine.is_pipe_parallel:
@@ -849,20 +871,7 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
-    scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
-    elif scheduler_type == 'cosine':
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'] * steps_per_epoch, eta_min=1e-6)
-    else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
-    model_engine.lr_scheduler = lr_scheduler
+    model_engine.lr_scheduler = build_lr_scheduler(optimizer, config, steps_per_epoch)
 
     step = 1
     examples = global_batch_size
@@ -892,6 +901,21 @@ if __name__ == '__main__':
         del client_state
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
+
+        # With --reset_optimizer / --reset_optimizer_params DeepSpeed does not
+        # restore the scheduler, so the schedule built above is still at
+        # last_epoch=0 and would replay warmup from the beginning. Fast-forward
+        # it by the steps that already completed.
+        lr_state_was_loaded = (
+            'force_constant_lr' not in config
+            and not args.reset_optimizer
+            and not args.reset_optimizer_params
+        )
+        if not lr_state_was_loaded and 'force_constant_lr' not in config:
+            # step is the NEXT step to run, so step - 1 steps already completed.
+            fast_forward_lr_scheduler(model_engine, max(0, step - 1))
+            if is_main_process():
+                print(f'lr after fast-forward: {model_engine.lr_scheduler.get_last_lr()}')
 
     if 'force_constant_lr' in config:
         model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
@@ -930,12 +954,43 @@ if __name__ == '__main__':
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
-            if hasattr(optimizer, '_grad_norm'):
-                tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+
+            current_lr = None
+            try:
+                current_lr = model_engine.get_lr()[0]
+                tb_writer.add_scalar('train/lr', current_lr, x_axis)
+            except Exception:
+                pass
+
+            wandb_data = {'train/loss': loss, 'step': x_axis}
+            if current_lr is not None:
+                wandb_data['train/lr'] = current_lr
+
+            grad_norm = None
+            custom_step = getattr(model_engine, '_custom_global_grad_norm_step', None)
+            if custom_step is None or custom_step == x_axis:
+                grad_norm = getattr(model_engine, '_custom_global_grad_norm', None)
+            if grad_norm is None and getattr(optimizer, '_grad_norm', None) is not None:
+                grad_norm = optimizer._grad_norm
+            if grad_norm is not None:
+                tb_writer.add_scalar('train/grad_norm', grad_norm, x_axis)
+                wandb_data['train/grad_norm'] = grad_norm
+
+            debug_metrics = getattr(optimizer, '_debug_metrics', None)
+            debug_step = getattr(optimizer, '_debug_metrics_step', None)
+            if debug_metrics:
+                if debug_step is None or debug_step == x_axis:
+                    for k, v in debug_metrics.items():
+                        tb_writer.add_scalar(k, v, x_axis)
+                        wandb_data[k] = v
+                elif is_main_process():
+                    print(f'skipping stale debug metrics: step={debug_step}, log step={x_axis}')
+                # Consumed either way, so a stale block cannot be re-logged.
+                optimizer._debug_metrics = None
+                optimizer._debug_metrics_step = None
+
             if wandb_enable:
-                wandb.log({'train/loss': loss, 'step': x_axis})
-                if hasattr(optimizer, '_grad_norm'):
-                    wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+                wandb.log(wandb_data)
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)

@@ -1,0 +1,104 @@
+# Muon + Kahan-AdamW + WSD schedule, LoKr adapter.
+#
+# This is the fork's own example of the `muon_kahan` optimizer: matrix
+# parameters go to Muon, everything else to a Kahan-summation AdamW.
+# Compared to the Colab patch this was ported from, the route is selected by an
+# explicit `type`, so it can never silently fall back to a stock optimizer.
+
+output_dir = "./ckpt"
+dataset = "./configs/anima_dataset.toml"
+
+blocks_to_swap = 26
+
+epochs = 5
+
+# Batch size of a single forward/backward pass for one GPU.
+micro_batch_size_per_gpu = 1
+pipeline_stages = 1
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+
+# Muon needs a real warmup; 30-40 steps is the usual floor.
+warmup_steps = 50
+
+lr_scheduler = "wsd"
+wsd_decay_frac = 0.5
+
+save_every_n_epochs = 1
+save_every_n_steps = 50
+checkpoint_every_n_epochs = 1
+checkpoint_every_n_minutes = 20
+
+activation_checkpointing = 'unsloth'
+save_dtype = "bfloat16"
+caching_batch_size = 1
+
+[model]
+type = "anima"
+transformer_path = "/data/models/anima-base-v1.0.safetensors"
+llm_path = "/data/models/qwen_3_06b_base.safetensors"
+vae_path = "/data/models/qwen_image_vae.safetensors"
+dtype = "bfloat16"
+llm_adapter_lr = 0.0
+
+[adapter]
+type = "lokr"
+rank = 1e6
+decompose_factor = 4
+dtype = "bfloat16"
+
+[optimizer]
+# `muon_kahan` (not `Muon`) is the type that enables the split below.
+# It is implemented in optimizers/muon_kahan.py and wired in train.py.
+type = "muon_kahan"
+lr = 1e-3
+weight_decay = 0.01
+
+# Separate LR for the AdamW group. With a LoKr adapter that group holds the
+# low-rank factors plus every 1-D parameter, which is where LoKr wants a much
+# smaller step than the transformer matrices.
+adamw_lr = 1e-4
+
+# 2-D params with min(shape[-2:]) >= 32 go to Muon; lokr_w2 is [4, 4] and does
+# not clear the bar, so the adapter factors land in the AdamW group.
+muon_min_size = 32
+
+# Carry an fp32 running total for the AdamW group so bf16 parameters do not
+# round away updates smaller than one ulp.
+kahan_adamw = true
+adamw_betas = [0.95, 0.995]
+adamw_eps = 1e-8
+
+# Optional separate weight decay for the AdamW group. Leave commented out to
+# keep the weight_decay=0 that train.py sets for 1-D params and llm_adapter.embed.
+#adamw_weight_decay = 0.01
+
+[debug]
+# Print the optimizer's param_groups once at startup. No runtime cost.
+log_param_groups = true
+
+# Global grad norm. Cheap-ish: it reads gradients.
+log_grad_norm = false
+
+# Per-group grad norm (muon / adamw). Nearly free once log_grad_norm is on.
+log_group_grad_norm = false
+
+# Param norm for the Muon group. Off by default: that group is the large one.
+log_muon_param_norm = false
+
+# Param norm for the AdamW group. Cheap: that group is small.
+log_adamw_param_norm = true
+
+# How far the AdamW parameters actually moved this step. Cheap: only the small
+# AdamW group is cloned.
+log_adamw_update_norm = true
+
+# Norms of the AdamW internal state (exp_avg, exp_avg_sq, kahan_comp).
+log_adamw_state_norm = true
+
+# How often to compute the above. Defaults to 10; note that leaving this unset
+# ties it to logging_steps, which is 1 in this repo and would run every step.
+debug_every_n_steps = 10
+
+[monitoring]
+enable_wandb = true
