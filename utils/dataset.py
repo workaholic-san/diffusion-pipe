@@ -26,6 +26,7 @@ from comfy_api.latest import InputImpl
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
+from utils.resume_position import resume_skip_batches
 import comfy.model_management as mm
 
 
@@ -1426,8 +1427,10 @@ class PipelineDataLoader:
         assert not self.iter_called
         self.epoch = state_dict['epoch']
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
-        # pulled than the actual number of batches iterated by the caller.
-        self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        # pulled than the actual number of batches iterated by the caller - and
+        # clamped at 0, because an epoch-boundary checkpoint stores exactly 0
+        # (see utils/resume_position.py).
+        self.num_batches_pulled = resume_skip_batches(state_dict['num_batches_pulled'])
         self._create_dataloader(skip_first_n_batches=self.num_batches_pulled)
         self.data = self._pull_batches_from_dataloader()
         # Recreate the dataloader after the first pass so that it won't skip

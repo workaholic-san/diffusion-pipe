@@ -1,0 +1,48 @@
+# =============================================================================
+# EDIT THE `path = ` LINE BELOW - it must point at your crop folder.
+# =============================================================================
+#
+# Stage 2 of a 3-stage queue (see examples/muon_kahan_phase_queue.toml):
+# square crops of the parents, at ONE resolution only.
+#
+# The caption describes the WHOLE parent image while the model only sees the
+# crop - that is exactly the tiled-ksampler situation this stage exists to
+# teach, so the mismatch between prompt and pixels is the point, not a bug.
+#
+# This stage is 3 epochs over 80 images, and that is a SMALL stage. Do not read
+# a step count from a file: it depends on the global batch size, which is
+# micro_batch_size_per_gpu x gradient_accumulation_steps x data-parallel world
+# size. With 1 x 4 x 2 (a 2-GPU run) the 80 square crops make one size bucket
+# and you get roughly 10 optimizer steps per epoch, ~30 for the stage; on a
+# single GPU with a global batch of 4 it is roughly 20 per epoch, ~60 total.
+# Either way it is a couple of percent of the run.
+#
+# That is enough to move the model's behaviour on tiles, not enough to relearn
+# anything - which is the intent. Do NOT grow this stage by raising num_repeats
+# here: the owner asked for num_repeats = 1 everywhere, and the stage budget is
+# expressed in `epochs` instead. If the stage turns out to be too small to matter,
+# the lever is more epochs in THIS file's queue entry, not more repeats.
+#
+# train.py prints the real steps/epoch and total_steps per stage at startup,
+# before the GPU is busy. Take the number from there.
+#
+# --- AR BUCKET SETTINGS -----------------------------------------------------
+# Must stay byte-identical to the other two stage files. See the long note in
+# configs/anima_phase1_imgflip_dataset.toml - the grid is cached on disk per
+# directory and train.py reuses that cache instead of rescanning.
+#
+# Note that crops are square, so they all land in the 1.0 bucket regardless of
+# how wide the grid is; the other buckets simply come out empty here.
+# -----------------------------------------------------------------------------
+
+resolutions = [1536]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+frame_buckets = [1]
+
+[[directory]]
+path = '/data/datasets/anima/crop'
+num_repeats = 1

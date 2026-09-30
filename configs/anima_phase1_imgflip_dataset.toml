@@ -1,0 +1,77 @@
+# =============================================================================
+# EDIT THE `path = ` LINES BELOW - they must point at your image folders.
+# =============================================================================
+#
+# Stage 1 of a 3-stage queue (see examples/muon_kahan_phase_queue.toml):
+# the full-resolution parents and their mirrored copies, at every resolution.
+#
+#   img   270 images  -> 512, 1024, 1536
+#   flip  208 images  -> 512, 1024, 1536   (mirrored augments, captions reworded)
+#
+# --- WHY THE CACHE CAN BE DESTROYED, AND WHAT MUST MATCH ---------------------
+# The latent cache is keyed by a fingerprint. utils/dataset.py::_map_and_cache
+# hashes the HF dataset it is given, and utils/cache.py::Cache.init() compares
+# that hash with the stored one; on ANY difference it prints
+#     [CACHE] Fingerprint changed, deleting existing cache files
+# and DELETES metadata.db plus every shard_*.bin before trying to re-encode.
+# So if two stage files disagree about anything that feeds a fingerprint, the
+# later stage wipes the earlier stage's latents and tries to rebuild them.
+#
+# There are TWO fingerprint layers, with different inputs:
+#
+#   Layer 1 - the metadata dataset (DirectoryDataset._metadata_map_fn). Fed by:
+#     * the actual image files (their width/height, and frame count for video)
+#     * the actual caption files, plus caption_prefix, shuffle_tags,
+#       cache_shuffle_num, cache_shuffle_delimiter, skip_empty_caption
+#     * the AR bucket grid: min_ar / max_ar / num_ar_buckets, or ar_buckets
+#     * frame_buckets
+#     * shuffle_metadata - it calls metadata_dataset.shuffle(seed=...) before
+#       the dataset is saved, and a shuffled dataset has a different hash
+#     * online_captions / captions.json, mask_path, control_path,
+#       default_mask_file, when those modes are used
+#
+#   Layer 2 - one extra dataset per AR bucket PER RESOLUTION
+#     (ARBucketDataset.cache_latents), which adds the size_bucket column. Fed
+#     by everything in layer 1 PLUS:
+#     * `resolutions` (it sets that column)
+#     * the model's round_to_multiple, which rounds w and h
+#     Each resolution's latent cache hangs off its own hash, so changing
+#     `resolutions` for a directory invalidates that directory's latents even
+#     though the AR grid is untouched.
+#
+# NOTE num_repeats is NOT a fingerprint input. It changes how many times the
+# data is iterated per epoch, not what the metadata dataset contains, so a
+# mismatch there will not destroy a cache. It is kept equal across stages only
+# because the owner wants the epoch budget expressed in epochs.
+#
+# What I have actually VERIFIED for the three shipped stage configs: every
+# layer-1 and layer-2 config field listed above that is expressible in the TOML
+# is equal across the stages that share a directory - the AR grid, frame_buckets,
+# caption_prefix, shuffle_tags, cache_shuffle_num, cache_shuffle_delimiter,
+# skip_empty_caption, shuffle_metadata, online_captions, mask_path, control_path,
+# default_mask_file, and per-directory resolutions. What I have NOT verified: that
+# the image files, caption files and the installed `datasets` version are
+# identical across your two machines. Those are environmental, and a mismatch in
+# any of them produces exactly the same destructive log line. Keep the same
+# uv.lock on both machines and copy the image/caption files byte for byte.
+#
+# min_ar / max_ar do NOT filter. Every image lands in the NEAREST bucket, so a
+# 3:1 panorama is trained as 2:1 rather than dropped. The range only decides how
+# many buckets exist and where their edges fall.
+# -----------------------------------------------------------------------------
+
+resolutions = [512, 1024, 1536]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+frame_buckets = [1]
+
+[[directory]]
+path = '/data/datasets/anima/img'
+num_repeats = 1
+
+[[directory]]
+path = '/data/datasets/anima/flip'
+num_repeats = 1

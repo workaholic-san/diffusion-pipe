@@ -1,0 +1,209 @@
+# Muon + Kahan-AdamW, LoKr adapter, staged over three phases in ONE run.
+#
+# Derived from examples/muon_kahan_wsd_lokr.toml. The optimizer, the adapter
+# and the per-category LR table are unchanged; what is new is the `[[phase]]`
+# queue at the bottom.
+#
+# Why a queue instead of three runs with --resume_from_checkpoint: a resumed
+# process rebuilds its schedule against a GLOBAL step counter, so a 3-epoch
+# decay stage starting at step 1071 of a 1131-step schedule would be ~95%
+# finished before its first optimizer step. The queue sizes every stage against
+# its own budget, switches datasets in-process, and lets optimizer momentum
+# carry across the boundary - so there is no restart to babysit.
+#
+# Run it in two steps. The cache lives INSIDE each image directory
+# (<image_dir>/cache/anima/), which is the one thing that makes this fiddly:
+#
+#   1) on the machine that has the images and a GPU:
+#        deepspeed --num_gpus=1 train.py --deepspeed \
+#          --config examples/muon_kahan_phase_queue.toml --cache_only
+#      Every stage's dataset is registered up front, so this ONE pass encodes
+#      latents + text embeddings for all three stages. img and flip are encoded
+#      once and re-read by stage 3 - you are not paying three times.
+#
+#   2) carry the caches to the 2-GPU machine. For each of img / flip / crop:
+#        mkdir -p <image_dir>                     # must EXIST, may stay empty
+#        cp -r <machine1>/<image_dir>/cache <image_dir>/
+#      The directory has to exist because DirectoryDataset raises on a missing
+#      path (utils/dataset.py), but it does NOT have to contain images.
+#      Keep the environment identical (same uv.lock / `datasets` version), the
+#      same dataset configs, and the same model weights - VAE and text encoder
+#      are loaded on machine 2 too, so only GPU hours are saved, not disk.
+#        deepspeed --num_gpus=2 train.py --deepspeed \
+#          --config examples/muon_kahan_phase_queue.toml --trust_cache
+#
+#      Do NOT add --regenerate_cache.
+#
+#      Before the long run, validate the copied cache with a cheap pass. Both
+#      flags are REQUIRED here: --cache_only on its own re-scans the (now empty)
+#      image directory and cannot validate an image-free cache at all.
+#        deepspeed --num_gpus=2 train.py --deepspeed \
+#          --config examples/muon_kahan_phase_queue.toml \
+#          --trust_cache --cache_only
+#      Read the log: you want "Found grouped metadata cache" and NO
+#      "[CACHE] Fingerprint changed, deleting existing cache files".
+#      That line means the copied cache is about to be thrown away and rebuilt
+#      from images you no longer have.
+#
+# `epochs` is deliberately ABSENT at the top level: the queue is the single
+# source of truth and train.py writes the sum (9) into it. Setting it by hand
+# to anything else is refused rather than silently truncating the run.
+
+output_dir = "./ckpt"
+
+micro_batch_size_per_gpu = 1
+
+# Two GPUs, ONE model: pipeline parallelism cuts the 31 layers (InitialLayer,
+# LLMAdapterLayer, 28 transformer blocks, FinalLayer) across the two cards
+# instead of each card holding a full copy. Launch with
+#   deepspeed --num_gpus=2 train.py --deepspeed --config <this file>
+# `--num_gpus` is a deepspeed LAUNCHER flag, not a train.py argument.
+#
+# With pipeline_stages = 2 and 2 GPUs the data-parallel world size is 1, so
+# global batch = 1 * 4 * 1 = 4 (it was 8 at pipeline_stages = 1). An epoch is
+# therefore about twice as long in steps, and every phase's own budget scales
+# with it - read the printed steps/epoch per phase, do not reuse old numbers.
+#
+# There is no block swapping here on purpose: train.py asserts
+# pipeline_stages == 1 whenever blocks_to_swap is set, and the swap existed
+# only to squeeze a full model onto one card.
+pipeline_stages = 2
+
+# How the layers are cut into stages. 'parameters' balances by parameter count
+# and is the default; the manual form (utils/pipeline.py) takes
+# `partition_split` - one INTEGER boundary per stage minus one, e.g. [15] puts
+# layers 0..14 on stage 0. Use it only if the two cards are not the same size.
+# Do not set it to 'manual' and leave partition_split alone: the default is
+# len(layers) / pipeline_stages = 15.5, and a float boundary fails on slicing.
+partition_method = 'parameters'
+# partition_method = 'manual'
+# partition_split = [15]
+
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+
+save_every_n_epochs = 1
+save_every_n_steps = 50
+checkpoint_every_n_epochs = 1
+checkpoint_every_n_minutes = 20
+
+# No activation checkpointing to begin with: halving the resident weights is
+# exactly what the last run was missing (it had to cap at 1420 to fit 1536).
+# If 1536 still OOMs, climb one rung at a time - each is a one-line change:
+#   activation_checkpointing = true            # plain torch checkpoint
+#   reentrant_activation_checkpointing = true  # only if the above misbehaves
+#   activation_checkpointing = 'unsloth'       # last resort; forces reentrant
+activation_checkpointing = false
+save_dtype = "bfloat16"
+caching_batch_size = 1
+
+[model]
+type = "anima"
+transformer_path = "/data/models/anima-base-v1.0.safetensors"
+llm_path = "/data/models/qwen_3_06b_base.safetensors"
+vae_path = "/data/models/qwen_image_vae.safetensors"
+dtype = "bfloat16"
+llm_adapter_lr = 0.0
+
+[adapter]
+type = "lokr"
+rank = 1e6
+decompose_factor = 4
+dtype = "bfloat16"
+
+[optimizer]
+# `muon_kahan` (not `Muon`) is the type that enables the split below.
+# It is implemented in optimizers/muon_kahan.py and wired in train.py.
+type = "muon_kahan"
+lr = 1e-3
+weight_decay = 0.01
+
+# Separate LR for the AdamW group. With a LoKr adapter that group holds the
+# low-rank factors plus every 1-D parameter, which is where LoKr wants a much
+# smaller step than the transformer matrices.
+adamw_lr = 1e-4
+
+# Per-category AdamW learning rates, overriding `adamw_lr` for the named group.
+# The keys are the anima module groups named by
+# models/cosmos_predict2.py::get_param_groups.
+#
+# From a 5-epoch run: the `mod` group had already trained faster than the
+# attention and MLP groups, so it is slowed down while those are raised. Muon
+# groups are not affected by this table — they keep the `lr` above.
+adamw_group_lr = { mod = 8e-5, self_attn = 1.5e-4, cross_attn = 1.5e-4, mlp = 1.5e-4 }
+
+# 2-D params with min(shape[-2:]) >= 32 go to Muon; lokr_w2 is [4, 4] and does
+# not clear the bar, so the adapter factors land in the AdamW group.
+muon_min_size = 32
+
+# Carry an fp32 running total for the AdamW group so bf16 parameters do not
+# round away updates smaller than one ulp.
+kahan_adamw = true
+adamw_betas = [0.95, 0.995]
+adamw_eps = 1e-8
+
+[debug]
+# Print the optimizer's param_groups once at startup. No runtime cost.
+log_param_groups = true
+
+# Global grad norm. Cheap-ish: it reads gradients.
+log_grad_norm = false
+
+# Per-group grad norm (muon / adamw). Nearly free once log_grad_norm is on.
+log_group_grad_norm = false
+
+# Param norm for the Muon group. Off by default: that group is the large one.
+log_muon_param_norm = false
+
+# Param norm for the AdamW group. Cheap: that group is small.
+log_adamw_param_norm = true
+
+# How far the AdamW parameters actually moved this step. Cheap: only the small
+# AdamW group is cloned.
+log_adamw_update_norm = true
+
+# Norms of the AdamW internal state (exp_avg, exp_avg_sq, kahan_comp).
+log_adamw_state_norm = true
+
+# How often to compute the above. Defaults to 10; note that leaving this unset
+# ties it to logging_steps, which is 1 in this repo and would run every step.
+debug_every_n_steps = 10
+
+[monitoring]
+enable_wandb = true
+
+# ---------------------------------------------------------------------------
+# The queue. Stages run in order inside one process, each with its own dataset,
+# epoch budget and LR schedule. Optimizer state is NOT reset at a boundary:
+# Adam's moments and Muon's momentum carry through, which is what makes stage 2
+# a genuine continuation at full LR rather than a fresh run that merely reuses
+# the weights.
+#
+# Epoch numbering stays absolute across stages, so checkpoints and models are
+# named epoch1..epoch9 with no collisions. The LR of every param group is
+# captured once at startup and restored at each stage start, so a stage always
+# begins at the configured LR instead of wherever the previous one ended.
+# ---------------------------------------------------------------------------
+
+[[phase]]
+name = "img_flip_full_lr"
+dataset = "configs/anima_phase1_imgflip_dataset.toml"
+epochs = 3
+lr_scheduler = "constant"
+warmup_steps = 60
+
+[[phase]]
+name = "crop_tiles"
+dataset = "configs/anima_phase2_crop_dataset.toml"
+epochs = 3
+lr_scheduler = "constant"
+warmup_steps = 0
+
+[[phase]]
+name = "all_decay"
+dataset = "configs/anima_phase3_all_dataset.toml"
+epochs = 3
+lr_scheduler = "linear"
+warmup_steps = 0
+# Stop the decay at 1/40 of the base LR instead of at zero.
+linear_end_factor = 0.025

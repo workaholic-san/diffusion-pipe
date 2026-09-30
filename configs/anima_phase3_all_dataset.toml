@@ -1,0 +1,50 @@
+# =============================================================================
+# EDIT THE `path = ` LINES BELOW - they must match the other two stage files.
+# =============================================================================
+#
+# Stage 3 of a 3-stage queue (see examples/muon_kahan_phase_queue.toml):
+# the whole mixture again, while the LR decays linearly to lr/40.
+#
+#   img   270 images  -> 512, 1024, 1536
+#   flip  208 images  -> 512, 1024, 1536
+#   crop   80 images  -> 1536 only
+#
+# This is the only file that trains on all three directories at once, and the
+# only one where a per-directory `resolutions` override is load-bearing: `crop`
+# is pinned to 1536 while img/flip inherit the top-level list. Per-directory
+# resolutions are supported natively - DirectoryDataset reads
+# `directory_config['resolutions']` and falls back to the top-level value.
+#
+# Because img and flip are trained at the same three resolutions in stage 1 and
+# stage 3, their latents and text embeddings are encoded once by stage 1's
+# --cache_only run and simply re-read here - budget that pass for
+# img + flip + crop, not for three separate encoding passes.
+#
+# Why that is safe rather than hopeful: utils/dataset.py::_map_and_cache returns
+# the existing cache untouched as soon as it already holds every item, before it
+# would call the encoder, and Cache.init() only deletes on a fingerprint
+# mismatch. Stage 1's and stage 3's entries for `img` produce the same metadata
+# dataset and therefore the same fingerprint, so the second visit is a read.
+# The same argument does NOT hold for `crop` if you change its resolutions.
+# -----------------------------------------------------------------------------
+
+resolutions = [512, 1024, 1536]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+frame_buckets = [1]
+
+[[directory]]
+path = '/data/datasets/anima/img'
+num_repeats = 1
+
+[[directory]]
+path = '/data/datasets/anima/flip'
+num_repeats = 1
+
+[[directory]]
+path = '/data/datasets/anima/crop'
+resolutions = [1536]
+num_repeats = 1

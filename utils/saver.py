@@ -45,7 +45,7 @@ def need_to_checkpoint(config, epoch=None):
 
 
 class Saver:
-    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model):
+    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model, phase_signature=None):
         self.args = args
         self.config = config
         self.is_adapter = is_adapter
@@ -54,6 +54,10 @@ class Saver:
         self.train_dataloader = train_dataloader
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
+        # The shape of the phase queue this run is following, so a resume can
+        # refuse a checkpoint that was written under a different one. None for a
+        # run without a queue, and for checkpoints written before it existed.
+        self.phase_signature = phase_signature
 
     def save_adapter(self, name):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
@@ -116,13 +120,16 @@ class Saver:
             self.save_full_model(name)
 
     def save_checkpoint(self, step, examples):
+        client_state = {
+            'step': step,
+            'examples': examples,
+            'custom_loader': self.train_dataloader.state_dict(),
+        }
+        if self.phase_signature is not None:
+            client_state['phase_queue'] = self.phase_signature
         self.model_engine.save_checkpoint(
             self.save_root,
-            client_state={
-                'step': step,
-                'examples': examples,
-                'custom_loader': self.train_dataloader.state_dict(),
-            },
+            client_state=client_state,
             save_latest=True,
             exclude_frozen_parameters=True
         )

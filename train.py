@@ -26,7 +26,8 @@ from utils import dataset as dataset_util
 from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
-from utils.lr_schedulers import build_lr_scheduler, fast_forward_lr_scheduler
+from utils.lr_schedulers import build_lr_scheduler, capture_base_lrs, fast_forward_lr_scheduler
+from utils import phase_plan as phase_plan_util
 from utils.train_debug import install_debug_hook
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
@@ -395,8 +396,21 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    with open(config['dataset']) as f:
-        dataset_config = toml.load(f)
+    # A `[[phase]]` queue can point each stage at a different dataset config, so
+    # the set of dataset files is only known once the queue is resolved. The
+    # queue is validated before anything is loaded or cached: a typo in a phase
+    # should cost a config parse, not an hour of VAE encoding.
+    phase_queue = phase_plan_util.normalize_phase_plan(config)
+    dataset_configs = {}
+    for ph in phase_queue:
+        if ph.dataset not in dataset_configs:
+            with open(ph.dataset) as f:
+                dataset_configs[ph.dataset] = toml.load(f)
+    if is_main_process():
+        print(f'Training plan: {len(phase_queue)} phase(s), '
+              f'{sum(p.epochs for p in phase_queue)} epochs total')
+        for ph in phase_queue:
+            print('  ' + phase_plan_util.describe(ph))
 
     micro_batch_size_per_gpu = config.get('micro_batch_size_per_gpu', 1)
     if isinstance(micro_batch_size_per_gpu, int):
@@ -435,8 +449,16 @@ if __name__ == '__main__':
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
-    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
-    dataset_manager.register(train_data)
+    # Every phase's dataset is registered up front, so `--cache_only` encodes all
+    # of them and `--trust_cache` finds every cache already present. A stage
+    # switched to later is then pure I/O: the VAE and text encoders are freed
+    # before training starts and are never needed again.
+    train_datasets = {}
+    for path, dcfg in dataset_configs.items():
+        ds = dataset_util.Dataset(dcfg, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+        dataset_manager.register(ds)
+        train_datasets[path] = ds
+    train_data = train_datasets[phase_queue[0].dataset]
 
     eval_data_map = {}
     for i, eval_dataset in enumerate(config['eval_datasets']):
@@ -557,7 +579,12 @@ if __name__ == '__main__':
     os.makedirs(run_dir, exist_ok=True)
     if not resume_from_checkpoint and is_main_process():
         shutil.copy(args.config, run_dir)
-        shutil.copy(config['dataset'], run_dir)
+        # Prefixed by dataset ordinal, so two DIFFERENT dataset files that share
+        # a basename cannot overwrite each other. Two stages pointing at one
+        # dataset file share a single copy, which is what they would have read
+        # anyway.
+        for i, path in enumerate(dataset_configs):
+            shutil.copy(path, os.path.join(run_dir, f'phase{i + 1}_{os.path.basename(path)}'))
         for eval_dataset in config['eval_datasets']:
             shutil.copy(eval_dataset['config'], run_dir)
     dist.barrier()
@@ -847,13 +874,21 @@ if __name__ == '__main__':
          grid = model_engine.grid
          model_engine.first_last_stage_group = dist.new_group(ranks=[grid.pp_group[0], grid.pp_group[-1]])
 
-    train_data.post_init(
-        model_engine.grid.get_data_parallel_rank(),
-        model_engine.grid.get_data_parallel_world_size(),
-        micro_batch_size_per_gpu,
-        model_engine.gradient_accumulation_steps(),
-        image_micro_batch_size_per_gpu,
-    )
+    def init_dataset(ds):
+        # Runs for the first phase here, and for each later phase when the queue
+        # switches to it. post_init builds the size buckets, so it must run
+        # exactly once per Dataset object.
+        if ds.post_init_called:
+            return
+        ds.post_init(
+            model_engine.grid.get_data_parallel_rank(),
+            model_engine.grid.get_data_parallel_world_size(),
+            micro_batch_size_per_gpu,
+            model_engine.gradient_accumulation_steps(),
+            image_micro_batch_size_per_gpu,
+        )
+
+    init_dataset(train_data)
     for eval_data in eval_data_map.values():
         eval_data.post_init(
             model_engine.grid.get_data_parallel_rank(),
@@ -868,10 +903,42 @@ if __name__ == '__main__':
     communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
 
-    train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
-    steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
+    # Captured once, before any schedule has run. Every phase is built against
+    # this baseline, so a stage that follows a decayed one starts at the
+    # configured LR instead of wherever the previous stage left its groups.
+    base_lrs = capture_base_lrs(optimizer)
+    phase_index = 0
 
-    model_engine.lr_scheduler = build_lr_scheduler(optimizer, config, steps_per_epoch)
+    def build_phase_scheduler(index, phase_steps_per_epoch):
+        ph = phase_queue[index]
+        try:
+            return build_lr_scheduler(optimizer, ph.config, phase_steps_per_epoch, base_lrs=base_lrs)
+        except ValueError as e:
+            # e.g. a warmup that does not fit inside this stage's own budget.
+            raise phase_plan_util.PhaseError(f'phase {index + 1} (`{ph.name}`): {e}') from e
+
+    def build_phase_loader(index, first_epoch):
+        """The dataloader for `phase_queue[index]`, positioned at `first_epoch`.
+
+        One construction path for startup, for every later stage switch and for
+        a resume, so a restored run loads exactly the stage it died in. Epoch
+        numbering stays absolute over the whole run, so checkpoint and model
+        names (epoch4, epoch7, ...) stay unique and monotonic across stages
+        instead of restarting at 1 in each one.
+        """
+        data = train_datasets[phase_queue[index].dataset]
+        init_dataset(data)
+        loader = dataset_util.PipelineDataLoader(
+            data, model_engine, model_engine.gradient_accumulation_steps(), model)
+        loader.epoch = first_epoch
+        return loader, len(loader) // model_engine.gradient_accumulation_steps()
+
+    train_dataloader, steps_per_epoch = build_phase_loader(0, phase_queue[0].first_epoch)
+    phase_start_epoch = phase_queue[0].first_epoch
+
+    model_engine.lr_scheduler = build_phase_scheduler(phase_index, steps_per_epoch)
+    if is_main_process():
+        print(phase_plan_util.describe(phase_queue[phase_index], steps_per_epoch))
 
     step = 1
     examples = global_batch_size
@@ -889,18 +956,58 @@ if __name__ == '__main__':
             optimizer.param_groups = param_groups
         dist.barrier()  # just so the print below doesn't get swamped
         assert load_path is not None
-        if args.reset_dataloader:
-            train_dataloader.epoch = client_state['custom_loader']['epoch']
-        else:
-            train_dataloader.load_state_dict(client_state['custom_loader'])
+        saved_loader_state = client_state['custom_loader']
+        saved_queue = client_state.get('phase_queue')
         step = client_state['step'] + 1
         if 'examples' in client_state:
             examples = client_state['examples'] + global_batch_size
         else:
             examples = step * global_batch_size
         del client_state
+
+        # Epoch numbering is absolute over the whole run, so the saved epoch
+        # names the stage the run died in - including a save taken between two
+        # epoch boundaries, which is where checkpoint_every_n_minutes usually
+        # leaves a long run.
+        saved_epoch = int(saved_loader_state['epoch'])
+        target_index = phase_plan_util.resume_phase_index(phase_queue, saved_epoch)
+        if target_index is None:
+            raise RuntimeError(phase_plan_util.resume_refusal(phase_queue, saved_epoch))
+
+        # A checkpoint written under a different queue maps this epoch onto a
+        # different stage, so the stage it names would silently be the wrong
+        # one. And a checkpoint carrying NO signature proves nothing at all: it
+        # may come from a run of this same config without its [[phase]] block,
+        # and restoring its batch position into a stage's different dataset
+        # would train on the wrong data without a word. Refuse both directions.
+        if len(phase_queue) > 1 and saved_queue is None:
+            raise RuntimeError(phase_plan_util.missing_signature_refusal(phase_queue))
+        if saved_queue is not None and saved_queue != phase_plan_util.queue_signature(phase_queue):
+            raise RuntimeError(
+                phase_plan_util.queue_mismatch_refusal(saved_queue, phase_queue))
+
+        if target_index == 0:
+            if args.reset_dataloader:
+                train_dataloader.epoch = saved_epoch
+            else:
+                train_dataloader.load_state_dict(saved_loader_state)
+        else:
+            # A later stage owns a different dataset, so the loader built at
+            # startup cannot take this state dict. Build the stage's own loader
+            # and restore into that instead: same dataset, so the saved batch
+            # position still means something and training resumes mid-epoch.
+            train_dataloader, steps_per_epoch = build_phase_loader(target_index, saved_epoch)
+            if not args.reset_dataloader:
+                train_dataloader.load_state_dict(saved_loader_state)
+            else:
+                train_dataloader.epoch = saved_epoch
+            phase_index = target_index
+            phase_start_epoch = phase_queue[target_index].first_epoch
+
         if is_main_process():
-            print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
+            landed = phase_queue[target_index]
+            print(f'Resuming training from checkpoint. Resuming at epoch: {saved_epoch}, '
+                  f'step: {step}, phase {landed.index + 1} (`{landed.name}`)')
 
         # With --reset_optimizer / --reset_optimizer_params DeepSpeed does not
         # restore the scheduler, so the schedule built above is still at
@@ -911,7 +1018,30 @@ if __name__ == '__main__':
             and not args.reset_optimizer
             and not args.reset_optimizer_params
         )
-        if not lr_state_was_loaded and 'force_constant_lr' not in config:
+        if target_index > 0 and 'force_constant_lr' not in config:
+            # DeepSpeed restored the scheduler of whichever stage was running
+            # when the save happened. At a stage boundary that is the PREVIOUS
+            # stage's, already at its floor, while the loader has moved on to
+            # this one - so the restored object cannot be trusted here. Rebuild
+            # this stage's schedule from the configured base LRs and replay the
+            # steps it has already run, which makes the LR at the resume point
+            # the one this stage would have had.
+            model_engine.lr_scheduler = build_phase_scheduler(target_index, steps_per_epoch)
+            if phase_plan_util.schedule_varies(phase_queue[target_index]):
+                # --reset_dataloader deliberately throws the intra-epoch
+                # position away: the stage restarts at the top of the saved
+                # epoch. Replaying the LR over batches that are no longer
+                # consumed would leave the schedule AHEAD of the data.
+                saved_batches = (0 if args.reset_dataloader
+                                 else saved_loader_state['num_batches_pulled'])
+                completed = phase_plan_util.steps_completed_in_phase(
+                    phase_queue[target_index], saved_epoch, steps_per_epoch,
+                    saved_batches,
+                    model_engine.gradient_accumulation_steps())
+                fast_forward_lr_scheduler(model_engine, completed)
+                if is_main_process():
+                    print(f'lr after fast-forward: {model_engine.lr_scheduler.get_last_lr()}')
+        elif not lr_state_was_loaded and 'force_constant_lr' not in config:
             # step is the NEXT step to run, so step - 1 steps already completed.
             fast_forward_lr_scheduler(model_engine, max(0, step - 1))
             if is_main_process():
@@ -929,7 +1059,21 @@ if __name__ == '__main__':
 
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
-    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
+    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model, phase_signature=phase_plan_util.queue_signature(phase_queue) if len(phase_queue) > 1 else None)
+
+    def start_phase(index, first_epoch):
+        """Move the run onto phase `index`, beginning at absolute epoch `first_epoch`.
+
+        Optimizer state is deliberately NOT reset: the queue is one continuous
+        run, so Adam's moments and Muon's momentum carry across the switch and a
+        stage that wants a different LR says so in its own schedule.
+        """
+        ph = phase_queue[index]
+        loader, phase_steps_per_epoch = build_phase_loader(index, first_epoch)
+        model_engine.lr_scheduler = build_phase_scheduler(index, phase_steps_per_epoch)
+        if is_main_process():
+            print(f'=== {phase_plan_util.describe(ph, phase_steps_per_epoch)} ===')
+        return loader
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
@@ -1013,6 +1157,22 @@ if __name__ == '__main__':
             if new_epoch is None:
                 final_model_name = f'epoch{epoch}'
                 break
+            action, target = phase_plan_util.phase_action(
+                phase_queue, phase_index, phase_start_epoch, new_epoch)
+            if action == 'finish':
+                # config['epochs'] is validated to equal the sum of the phase
+                # budgets, so process_epoch normally ends the run one boundary
+                # earlier. Ending it here too keeps the queue authoritative if
+                # that ever stops being true.
+                final_model_name = f'epoch{epoch}'
+                break
+            if action == 'switch':
+                train_dataloader = start_phase(target, new_epoch)
+                # The saver reads the dataloader's epoch to detect boundaries and
+                # stores it in the checkpoint, so it must follow the switch.
+                saver.train_dataloader = train_dataloader
+                phase_index = target
+                phase_start_epoch = new_epoch
             epoch = new_epoch
 
         checkpointed, saved = saver.process_step(step, examples)

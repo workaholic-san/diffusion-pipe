@@ -31,7 +31,37 @@ def _is_main_process():
         return True
 
 
-def build_lr_scheduler(optimizer, config, steps_per_epoch):
+def capture_base_lrs(optimizer):
+    """The per-group LR a schedule is supposed to decay FROM.
+
+    Read before the first schedule of a run is built, and handed back to
+    `build_lr_scheduler` for every later phase. A phase that follows a decayed
+    phase must still start from the configured base LR, not from wherever the
+    previous phase happened to leave its groups.
+    """
+    return [group.get('initial_lr', group['lr']) for group in optimizer.param_groups]
+
+
+def set_base_lrs(optimizer, base_lrs):
+    """Pin every param group to its base LR before a schedule is constructed.
+
+    PyTorch's LRScheduler reads `base_lrs` from `group['initial_lr']`, so this
+    is what actually makes a freshly built schedule start where the config says
+    instead of where the previous phase left off.
+    """
+    if base_lrs is None:
+        return
+    if len(base_lrs) != len(optimizer.param_groups):
+        raise ValueError(
+            f'base_lrs has {len(base_lrs)} entries but the optimizer has '
+            f'{len(optimizer.param_groups)} param groups')
+    for group, lr in zip(optimizer.param_groups, base_lrs):
+        group['initial_lr'] = lr
+        group['lr'] = lr
+
+
+def build_lr_scheduler(optimizer, config, steps_per_epoch, base_lrs=None):
+    set_base_lrs(optimizer, base_lrs)
     scheduler_type = config.get('lr_scheduler', 'constant')
     warmup_steps = config.get('warmup_steps', 0)
     total_steps = config['epochs'] * steps_per_epoch
@@ -51,8 +81,37 @@ def build_lr_scheduler(optimizer, config, steps_per_epoch):
     if scheduler_type == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     elif scheduler_type == 'linear':
+        # A decay that stops at a floor instead of at zero. The default keeps
+        # the original end_factor=0.0, so an existing `linear` config is
+        # unaffected; `linear_end_factor = 0.025` is a decay to lr/40.
+        end_factor = float(config.get('linear_end_factor', 0.0))
+        if not 0.0 <= end_factor <= 1.0:
+            raise ValueError(
+                f'linear_end_factor must be in [0, 1], got {end_factor}')
+        # LinearLR reaches `end_factor` only AFTER `total_iters` step() calls,
+        # and the scheduler is stepped at the end of an optimizer step - so the
+        # last LR the optimizer actually uses is the coefficient at
+        # last_epoch = total_iters - 1, i.e. base * (1 - (1-end)/total_iters).
+        # With total_iters = main_total_iters a run advertised as decaying to
+        # lr/40 ends at lr/37.6 instead. Shortening the ramp by one makes the
+        # floor exact on the final step.
+        if end_factor > 0.0 and main_total_iters < 2:
+            # A floor of lr*<end_factor> is a promise about the LAST step. With a
+            # single step there is no ramp to place it on: LinearLR would use the
+            # base LR and never reach the floor, so the run would quietly do the
+            # opposite of what the config says. Refuse instead.
+            raise ValueError(
+                f'lr_scheduler="linear" with linear_end_factor={end_factor} needs at '
+                f'least 2 optimizer steps after warmup to reach its floor, but this '
+                f'schedule has {main_total_iters}. Give the stage more epochs or '
+                f'steps per epoch, drop linear_end_factor, or use lr_scheduler="constant".')
+        #
+        # end_factor == 0.0 is left alone on purpose: it is the pre-existing
+        # default, which never reached zero either (it stopped at 1/main_total_iters),
+        # and changing it would silently alter every existing `linear` config.
+        decay_iters = main_total_iters - 1 if end_factor > 0.0 else main_total_iters
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.0, total_iters=main_total_iters)
+            optimizer, start_factor=1.0, end_factor=end_factor, total_iters=decay_iters)
     elif scheduler_type == 'cosine':
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=main_total_iters, eta_min=1e-6)
