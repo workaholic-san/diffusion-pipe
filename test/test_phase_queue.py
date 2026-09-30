@@ -559,6 +559,49 @@ def test_the_signature_pins_the_schedule_not_only_the_stage_mapping():
     assert middle_stage['warmup_steps'] == 0, 'the middle stage must carry its own warmup'
 
 
+def test_the_signature_pins_the_settings_that_size_a_stage():
+    """Changing what SIZES a stage must invalidate a resume, not slip through.
+
+    `gradient_accumulation_steps` enters twice: steps_per_epoch is
+    len(loader) // gas, and steps_completed_in_phase divides the saved batch
+    count by it. The base LRs are what `capture_base_lrs` restores before a
+    later stage's schedule is built. Edit either between save and restart and
+    the LR at the resume point moves while the queue's shape - names, budgets,
+    dataset paths, schedule keys - stays byte-identical. A signature that
+    carried only the shape would wave exactly that through.
+    """
+    base = _owner_queue()
+    saved = phase_plan_util.queue_signature(
+        phase_plan_util.normalize_phase_plan(base))
+
+    for key, value in (('gradient_accumulation_steps', 8),
+                       ('micro_batch_size_per_gpu', 2),
+                       ('pipeline_stages', 1)):
+        edited = _owner_queue()
+        edited[key] = value
+        assert phase_plan_util.queue_signature(
+            phase_plan_util.normalize_phase_plan(edited)) != saved, (
+            f'changing {key} must invalidate the resume')
+
+    for key, value in (('lr', 5e-4), ('adamw_lr', 5e-5),
+                       ('adamw_group_lr', {'mod': 1e-4})):
+        edited = _owner_queue()
+        edited.setdefault('optimizer', {})[key] = value
+        assert phase_plan_util.queue_signature(
+            phase_plan_util.normalize_phase_plan(edited)) != saved, (
+            f'changing optimizer.{key} must invalidate the resume')
+
+    # And the values are read from the SHIPPED queue, not from a fixture.
+    shipped = phase_plan_util.normalize_phase_plan(
+        toml.load(REPO / 'examples' / 'muon_kahan_phase_queue.toml'))
+    sizing = phase_plan_util.queue_signature(shipped)[0][4]
+    assert sizing['gradient_accumulation_steps'] == 4
+    assert sizing['pipeline_stages'] == 2
+    assert sizing['lr'] == 1e-3
+    assert sizing['adamw_lr'] == 1e-4
+    assert sizing['adamw_group_lr']['mod'] == 8e-5
+
+
 def test_a_signature_less_checkpoint_cannot_be_resumed_into_a_queue():
     """Absence of a signature is ambiguous, so a queue must refuse it.
 

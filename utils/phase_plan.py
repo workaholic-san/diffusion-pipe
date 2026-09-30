@@ -219,6 +219,34 @@ def schedule_varies(phase):
     return phase.config.get('lr_scheduler', 'constant') != 'constant'
 
 
+# Config that SIZES a stage and sets its LR base. Both are consumed when a
+# resume rebuilds the schedule and replays the stage's local steps, so a change
+# here lands on a different learning rate at the resume point while leaving the
+# queue's shape - names, budgets, dataset paths, schedule keys - untouched.
+RESUME_SIZING_KEYS = (
+    'gradient_accumulation_steps',
+    'micro_batch_size_per_gpu',
+    'pipeline_stages',
+)
+RESUME_BASE_LR_KEYS = ('lr', 'adamw_lr', 'adamw_group_lr')
+
+
+def _resume_sizing_view(config):
+    """The settings that decide how many steps a stage has and what LR it starts from.
+
+    `gradient_accumulation_steps` enters twice: steps_per_epoch is
+    len(loader) // gas, and steps_completed_in_phase divides the saved batch
+    count by it. `micro_batch_size_per_gpu` and `pipeline_stages` reach it
+    through the global batch, which is what sizes the loader. The base LRs are
+    what capture_base_lrs restores before a later stage's schedule is built, so
+    editing one of them between save and resume also moves the LR.
+    """
+    optimizer = config.get('optimizer') or {}
+    view = {key: config.get(key) for key in RESUME_SIZING_KEYS}
+    view.update({key: optimizer.get(key) for key in RESUME_BASE_LR_KEYS})
+    return view
+
+
 def _schedule_view(phase):
     """The stage's effective schedule keys, in the fixed SCHEDULE_KEYS order.
 
@@ -244,7 +272,8 @@ def queue_signature(phases):
     without moving any epoch, so a signature that omitted it would resume onto a
     schedule the run was never trained under - silently.
     """
-    return [[ph.name, ph.epochs, ph.dataset, _schedule_view(ph)] for ph in phases]
+    return [[ph.name, ph.epochs, ph.dataset, _schedule_view(ph),
+             _resume_sizing_view(ph.config)] for ph in phases]
 
 
 def missing_signature_refusal(phases):
