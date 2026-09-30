@@ -109,8 +109,15 @@ def install_debug_hook(optimizer, config, model_engine):
     if _is_main_process() and bool(debug_cfg.get('log_param_groups', True)):
         print('\nOptimizer param_groups:')
         for i, group in enumerate(optimizer.param_groups):
-            info = {k: v for k, v in group.items() if k != 'params'}
-            print(f'  group {i} ({len(group["params"])} params): {info}')
+            # The model-supplied name leads the line: a numbered group is only
+            # actionable once you know which module group it is, and the number
+            # shifts with the model's category set and the weight-decay split.
+            info = {k: v for k, v in group.items() if k not in ('params', 'group_name')}
+            label = _group_label(i, group)
+            name = group.get('group_name')
+            if name:
+                label = f'{name}/{label}'
+            print(f'  group {i} ({len(group["params"])} params) {label}: {info}')
 
     original_step = optimizer.step
 

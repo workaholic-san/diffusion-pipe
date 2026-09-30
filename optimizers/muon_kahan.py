@@ -37,6 +37,22 @@ Group contract
   * `kahan`:   bool  -> whether to carry the fp32 compensation tensor
   * `betas` / `eps`: AdamW hyperparameters for the non-Muon group only
 
+Per-group learning rates
+------------------------
+`adamw_lr` sets ONE learning rate for every AdamW group. When a model hands
+its groups a `group_name` (anima does: `base`, `self_attn`, `cross_attn`,
+`mlp`, `mod`, `llm_adapter` — see `models/cosmos_predict2.py`), the config can
+address them individually:
+
+    adamw_group_lr = { mod = 8e-5, self_attn = 1.5e-4 }
+
+The name belongs to the model, not to this module: a group without
+`group_name`, or one whose name is not in the table, keeps `adamw_lr`. The
+override is deliberately restricted to AdamW groups — the Muon groups keep the
+lr their own group carries. A table key that matches no AdamW group is
+reported at startup rather than silently doing nothing, because a typo there
+looks exactly like a learning rate that was never applied.
+
 Supported versions
 ------------------
 Verified against **pytorch-optimizer 3.10.1**, the version installed here and
@@ -88,11 +104,48 @@ except Exception as exc:  # pragma: no cover - exercised only on a broken instal
 MUON_SPLIT_KEYS = (
     'muon_min_size',
     'adamw_lr',
+    'adamw_group_lr',
     'kahan_adamw',
     'adamw_betas',
     'adamw_eps',
     'adamw_weight_decay',
 )
+
+
+def _is_main_process():
+    """Rank check that does not import deepspeed (see utils/lr_schedulers.py)."""
+    try:
+        import torch.distributed as dist
+        return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _adamw_group_lr_table(raw):
+    """Validate the `group_name -> lr` table and return it with float values.
+
+    A malformed entry has to fail here, loudly and once. Coerced lazily it
+    would surface much later as a step that silently did nothing.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            'adamw_group_lr must be a table of group-name -> learning rate, '
+            f'got {type(raw).__name__}')
+    table = {}
+    for name, value in raw.items():
+        try:
+            lr = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'adamw_group_lr[{name!r}] = {value!r} is not a number') from exc
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError(
+                f'adamw_group_lr[{name!r}] must be a positive finite learning '
+                f'rate, got {value!r}')
+        table[str(name)] = lr
+    return table
 
 
 def is_muon_param(param, muon_min_size=32):
@@ -118,7 +171,7 @@ def is_muon_param(param, muon_min_size=32):
 
 
 def split_param_groups(param_groups, muon_min_size=32, adamw_lr=None,
-                       kahan_adamw=True, adamw_betas=(0.9, 0.999),
+                       adamw_group_lr=None, kahan_adamw=True, adamw_betas=(0.9, 0.999),
                        adamw_eps=1e-8, adamw_weight_decay=None):
     """Split every group into a Muon group and an AdamW group.
 
@@ -126,7 +179,14 @@ def split_param_groups(param_groups, muon_min_size=32, adamw_lr=None,
     already carries". That matters: `train.get_optimizer` deliberately sets
     `weight_decay = 0` on the group holding 1-D parameters and `llm_adapter.embed`,
     and an override applied unconditionally would silently undo that decision.
+
+    `adamw_group_lr` overrides `adamw_lr` per named group (see the module
+    docstring). A group with no `group_name` — every model that does not name
+    its groups — keeps `adamw_lr`, so this stays a per-model opt-in.
     """
+    lr_table = _adamw_group_lr_table(adamw_group_lr)
+    matched = set()
+
     out = []
     for group in param_groups:
         muon_params = [p for p in group['params'] if is_muon_param(p, muon_min_size)]
@@ -142,7 +202,11 @@ def split_param_groups(param_groups, muon_min_size=32, adamw_lr=None,
             g = group.copy()
             g['params'] = adamw_params
             g['use_muon'] = False
-            if adamw_lr is not None:
+            name = g.get('group_name')
+            if name is not None and name in lr_table:
+                g['lr'] = lr_table[name]
+                matched.add(name)
+            elif adamw_lr is not None:
                 g['lr'] = float(adamw_lr)
             if adamw_weight_decay is not None:
                 g['weight_decay'] = float(adamw_weight_decay)
@@ -150,6 +214,16 @@ def split_param_groups(param_groups, muon_min_size=32, adamw_lr=None,
             g['eps'] = float(adamw_eps)
             g['kahan'] = bool(kahan_adamw)
             out.append(g)
+
+    unmatched = sorted(set(lr_table) - matched)
+    if unmatched and _is_main_process():
+        # Loud on purpose: a name that matches nothing (typo, or a category with
+        # no AdamW parameters) leaves the learning rate exactly as it would have
+        # been without the table, which is indistinguishable from "it had no
+        # effect" until someone checks the numbers.
+        print(f'Warning: adamw_group_lr names {unmatched} matched no AdamW '
+              f'group; those learning rates were not applied. Group names seen: '
+              f'{sorted({str(g.get("group_name")) for g in out})}')
 
     return out
 

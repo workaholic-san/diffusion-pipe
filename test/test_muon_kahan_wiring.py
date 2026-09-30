@@ -10,6 +10,7 @@ importable. These tests reproduce its kwarg handling against the same constants
 the real code imports, which keeps the contract honest without a refactor.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -35,10 +36,67 @@ def test_example_config_declares_every_split_key():
     config = toml.load(EXAMPLE)
     optim = config['optimizer']
     assert optim['type'] == 'muon_kahan', 'the example must select the split explicitly'
-    for key in ('muon_min_size', 'adamw_lr', 'kahan_adamw', 'adamw_betas', 'adamw_eps'):
+    for key in ('muon_min_size', 'adamw_lr', 'adamw_group_lr', 'kahan_adamw',
+                'adamw_betas', 'adamw_eps'):
         assert key in optim, f'example config is missing {key}'
     assert config['lr_scheduler'] == 'wsd'
     assert 0.0 <= config['wsd_decay_frac'] < 1.0
+
+
+def test_example_lr_table_names_only_groups_anima_emits():
+    """The override table may only name module groups the model really creates.
+
+    These names are anima's own vocabulary, produced by
+    `models/cosmos_predict2.py::get_param_groups`. That module cannot be imported
+    here (models/base.py imports deepspeed), so this reads its source: each
+    category is bound as `<name>_params` and the group is emitted under that
+    same `<name>`. A name in the example that anima does not emit would apply to
+    nothing, so the example would quietly train on `adamw_lr` alone.
+    """
+    model_src = (REPO / 'models' / 'cosmos_predict2.py').read_text(encoding='utf-8')
+    block = re.search(r'named_groups = \[(.*?)\n        \]', model_src, re.S)
+    assert block, 'models/cosmos_predict2.py no longer builds an explicit named-group list'
+    names = set(re.findall(r"\('(\w+)',\s*\w+_lr,", block.group(1)))
+
+    assert {'self_attn', 'cross_attn', 'mlp', 'mod'} <= names, \
+        f'anima group names changed; the recipe refers to {sorted(names)}'
+
+    table = toml.load(EXAMPLE)['optimizer']['adamw_group_lr']
+    unknown = sorted(set(table) - names)
+    assert not unknown, f'the example overrides groups anima does not emit: {unknown}'
+
+
+def test_example_config_resolves_the_per_group_lrs_of_a_reported_run():
+    """Pin the recipe's resolved learning rates against a real run's layout.
+
+    That run reported `Num base params: 0` and `llm_adapter_lr = 0.0`, so the
+    eight groups it printed were exactly self_attn / cross_attn / mlp / mod,
+    each split muon-then-adamw, with the mod group the largest. Reproducing
+    that layout here means a change to the table, to the split, or to the
+    example shows up in the test suite instead of only several days into a
+    training run.
+    """
+    optim = toml.load(EXAMPLE)['optimizer']
+    muon_cfg = {k: optim[k] for k in MUON_SPLIT_KEYS if k in optim}
+
+    # (name, muon params, adamw params) as the run reported them.
+    counts = {'self_attn': 112, 'cross_attn': 112, 'mlp': 56, 'mod': 168}
+    groups = []
+    for name, n in counts.items():
+        params = [torch.nn.Parameter(torch.zeros(64, 64)) for _ in range(n)]   # -> Muon
+        params += [torch.nn.Parameter(torch.zeros(4, 4)) for _ in range(n)]   # -> AdamW
+        groups.append({'params': params, 'lr': optim['lr'],
+                       'weight_decay': optim['weight_decay'], 'group_name': name})
+
+    resolved = [(g['group_name'], g['use_muon'], g['lr'])
+                for g in split_param_groups(groups, **muon_cfg)]
+
+    assert resolved == [
+        ('self_attn', True, 1e-3), ('self_attn', False, 1.5e-4),
+        ('cross_attn', True, 1e-3), ('cross_attn', False, 1.5e-4),
+        ('mlp', True, 1e-3), ('mlp', False, 1.5e-4),
+        ('mod', True, 1e-3), ('mod', False, 8e-5),
+    ], f'the recipe no longer resolves to the intended per-group lrs: {resolved}'
 
 
 def test_split_keys_do_not_leak_into_torch_adamw():

@@ -706,12 +706,24 @@ class CosmosPredict2Pipeline(BasePipeline):
             print(f'Num llm_adapter params: {len(llm_adapter_params)}')
 
         param_groups = []
-        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params)]:
+        named_groups = [
+            ('base', base_lr, base_params),
+            ('self_attn', self_attn_lr, self_attn_params),
+            ('cross_attn', cross_attn_lr, cross_attn_params),
+            ('mlp', mlp_lr, mlp_params),
+            ('mod', mod_lr, mod_params),
+            ('llm_adapter', llm_adapter_lr, llm_adapter_params),
+        ]
+        for name, lr, params in named_groups:
             if lr == 0:
                 for p in params:
                     p.requires_grad_(False)
             elif len(params) > 0:
-                param_groups.append({'params': params, 'lr': lr})
+                # `group_name` is this model's own vocabulary, attached so that a
+                # consumer can select behaviour per module group (see
+                # `optimizer.adamw_group_lr`). Consumers that do not know the
+                # name simply ignore it and keep the group's own lr.
+                param_groups.append({'params': params, 'lr': lr, 'group_name': name})
 
         return param_groups
 

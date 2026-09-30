@@ -9,6 +9,8 @@ or without pytest:
     python test/test_muon_kahan.py
 """
 
+import contextlib
+import io
 import math
 import sys
 from pathlib import Path
@@ -24,6 +26,13 @@ from utils.lr_schedulers import build_lr_scheduler
 def _param(shape, seed):
     g = torch.Generator().manual_seed(seed)
     return torch.nn.Parameter(torch.randn(*shape, generator=g))
+
+
+def _named_group(name, params, lr=1e-3, **extra):
+    """A param group as a model that names its module groups produces one."""
+    group = {'params': list(params), 'lr': lr, 'group_name': name}
+    group.update(extra)
+    return group
 
 
 def test_split_routes_matrices_to_muon_and_vectors_to_adamw():
@@ -57,6 +66,99 @@ def test_split_preserves_zero_weight_decay_unless_overridden():
     groups_override = split_param_groups(src, muon_min_size=32, adamw_weight_decay=0.01)
     adamw2 = next(g for g in groups_override if g['use_muon'] is False)
     assert adamw2['weight_decay'] == 0.01, 'explicit override was ignored'
+
+
+def test_group_name_overrides_adamw_lr_per_group():
+    mod = _param((32,), 21)      # 1-D -> AdamW
+    attn = _param((32,), 22)     # 1-D -> AdamW
+
+    groups = split_param_groups(
+        [_named_group('mod', [mod]), _named_group('self_attn', [attn])],
+        muon_min_size=32, adamw_lr=1e-4,
+        adamw_group_lr={'mod': 8e-5, 'self_attn': 1.5e-4})
+
+    by_name = {g['group_name']: g for g in groups if g['use_muon'] is False}
+    assert by_name['mod']['lr'] == 8e-5, f"mod got {by_name['mod']['lr']}, expected 8e-05"
+    assert by_name['self_attn']['lr'] == 1.5e-4, \
+        f"self_attn got {by_name['self_attn']['lr']}, expected 1.5e-04"
+
+
+def test_group_name_override_does_not_touch_muon_groups():
+    mat = _param((64, 64), 23)
+    groups = split_param_groups([_named_group('mod', [mat], lr=1e-3)],
+                                muon_min_size=32, adamw_lr=1e-4,
+                                adamw_group_lr={'mod': 8e-5})
+    muon = next(g for g in groups if g['use_muon'])
+    assert muon['lr'] == 1e-3, 'the AdamW lr table reached a Muon group'
+
+
+def test_unnamed_group_keeps_adamw_lr():
+    """A model that does not name its groups is unaffected by the table.
+
+    The names are the model's own vocabulary, so an unnamed group must fall back
+    to the single `adamw_lr` rather than guess or fail.
+    """
+    vec = _param((32,), 24)
+    groups = split_param_groups([{'params': [vec], 'lr': 1e-3}],
+                                muon_min_size=32, adamw_lr=1e-4,
+                                adamw_group_lr={'mod': 8e-5})
+    adamw = next(g for g in groups if g['use_muon'] is False)
+    assert adamw['lr'] == 1e-4, f"unnamed group got {adamw['lr']}, expected the 1e-04 default"
+
+
+def test_unmatched_group_name_is_reported_and_ignored():
+    """A table key that matches nothing is loud, not silently inert."""
+    vec = _param((32,), 25)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        groups = split_param_groups([_named_group('mod', [vec])],
+                                    muon_min_size=32, adamw_lr=1e-4,
+                                    adamw_group_lr={'self_attn': 1.5e-4})
+    reported = buf.getvalue()
+    assert 'self_attn' in reported, \
+        f'an override that matched no group must be reported; stdout was {reported!r}'
+    adamw = next(g for g in groups if g['use_muon'] is False)
+    assert adamw['lr'] == 1e-4, 'an unmatched override must not disturb the default lr'
+
+
+def test_group_lr_table_rejects_malformed_values():
+    """A bad value has to fail at startup, not become a step that does nothing."""
+    vec = _param((32,), 26)
+    for bad in ({'mod': 'fast'}, {'mod': 0}, {'mod': -1e-4}, {'mod': float('inf')}, 'mod'):
+        try:
+            split_param_groups([_named_group('mod', [vec])], muon_min_size=32,
+                               adamw_group_lr=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'adamw_group_lr={bad!r} was accepted')
+
+
+def test_per_group_lr_reaches_the_optimizer_step():
+    """Same gradient, two groups: the higher lr must move the parameter further.
+
+    Without this the override could be carried as metadata and never read, which
+    would look identical in every other test.
+    """
+    slow = _param((64,), 27)
+    fast = _param((64,), 28)
+    groups = split_param_groups(
+        [_named_group('mod', [slow]), _named_group('mlp', [fast])],
+        muon_min_size=32, adamw_lr=1e-4, adamw_group_lr={'mod': 8e-5, 'mlp': 1.5e-4})
+    opt = MuonKahan(groups, lr=1e-3)
+
+    grad = torch.full((64,), 1e-3)
+    slow.grad = grad.clone()
+    fast.grad = grad.clone()
+    before_slow = slow.detach().clone()
+    before_fast = fast.detach().clone()
+
+    opt._adamw_kahan_step([g for g in opt.param_groups if g.get('use_muon') is False])
+
+    slow_moved = (slow.detach() - before_slow).abs().max().item()
+    fast_moved = (fast.detach() - before_fast).abs().max().item()
+    assert fast_moved > slow_moved, (
+        f'lr did not reach the step: mod moved {slow_moved:.3e}, '
+        f'mlp moved {fast_moved:.3e}')
 
 
 def test_is_muon_param_uses_matrix_axes_for_conv_weights():

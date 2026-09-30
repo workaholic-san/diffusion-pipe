@@ -59,6 +59,15 @@ weight_decay = 0.01
 # smaller step than the transformer matrices.
 adamw_lr = 1e-4
 
+# Per-category AdamW learning rates, overriding `adamw_lr` for the named group.
+# The keys are the anima module groups named by
+# models/cosmos_predict2.py::get_param_groups.
+#
+# From a 5-epoch run: the `mod` group had already trained faster than the
+# attention and MLP groups, so it is slowed down while those are raised. Muon
+# groups are not affected by this table — they keep the `lr` above.
+adamw_group_lr = { mod = 8e-5, self_attn = 1.5e-4, cross_attn = 1.5e-4, mlp = 1.5e-4 }
+
 # 2-D params with min(shape[-2:]) >= 32 go to Muon; lokr_w2 is [4, 4] and does
 # not clear the bar, so the adapter factors land in the AdamW group.
 muon_min_size = 32
