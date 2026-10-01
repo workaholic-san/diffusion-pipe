@@ -104,6 +104,13 @@ llm_path = "/data/models/qwen_3_06b_base.safetensors"
 vae_path = "/data/models/qwen_image_vae.safetensors"
 dtype = "bfloat16"
 llm_adapter_lr = 0.0
+# VAE encode tiling is OFF unless you set vae_max_area here: without it every
+# frame is encoded whole, which is exact and cheapest in VRAM. Set a positive
+# area only if a whole frame does not fit - e.g. vae_max_area = 1638400
+# (1280*1280), a safe fit for roughly 15 GB of VRAM. A tiled encode is not
+# bit-identical to a whole-frame one, so prefer it as a last resort.
+#vae_max_area = 1638400
+#vae_min_overlap = 128
 
 [adapter]
 type = "lokr"

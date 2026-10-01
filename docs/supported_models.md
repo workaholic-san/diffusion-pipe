@@ -264,28 +264,29 @@ vae_path = '/data2/imagegen_models/comfyui-models/wan_2.1_vae.safetensors'
 t5_path = '/data2/imagegen_models/comfyui-models/oldt5_xxl_fp16.safetensors'
 dtype = 'bfloat16'
 #transformer_dtype = 'float8_e5m2'
-# Largest area handed to the VAE in one call. A frame at or below this is
-# encoded whole; a larger one is split into overlapping tiles that are blended
-# back together. 1638400 (= 1280*1280) is a safe fit for roughly 15 GB of VRAM,
-# so raise it on a bigger card and lower it on a smaller one. Set to 0 to always
-# encode the whole frame.
+# Largest area handed to the VAE in one call. Tiling is OFF unless you set this:
+# without it (or with 0) every frame is encoded whole. Once you set a positive
+# area, a frame at or below it is encoded whole and a larger one is split into
+# overlapping tiles that are blended back together. 1638400 (= 1280*1280) is a
+# safe fit for roughly 15 GB of VRAM, so raise it on a bigger card and lower it
+# on a smaller one.
 #vae_max_area = 1638400
 # Overlap between neighbouring tiles, in pixels. More overlap hides seams
-# better and costs extra VRAM.
+# better and costs extra VRAM. Only read when tiling is on.
 #vae_min_overlap = 128
 ```
 
-Frames larger than `vae_max_area` are tiled instead of being encoded in one call, which is what lets
-you cache latents for images or video that do not fit in VRAM at once. The tiles are cut on multiples
-of the VAE's 8x spatial stride, and each seam is feathered over its own overlap, so the two ramps
-meeting at a seam are exact complements and the blend weights sum to 1 across the whole frame. The
-result is not bit-identical to a single whole-frame encode - a convolutional encoder sees different
-neighbourhoods at a tile edge - so expect a small difference in the cached latents. Frames whose
-height or width is not a multiple of 8 have the trailing pixels dropped, and the run says so in the log.
+Frames are encoded whole by default, which is exact: the encoder sees the entire frame. If a frame does
+not fit in VRAM, set `[model].vae_max_area` and frames larger than it are tiled instead of being encoded
+in one call. The tiles are cut on multiples of the VAE's 8x spatial stride, and each seam is feathered
+over its own overlap, so the two ramps meeting at a seam are exact complements and the blend weights sum
+to 1 across the whole frame. A tiled result is NOT bit-identical to a whole-frame encode - a
+convolutional encoder sees different neighbourhoods at a tile edge - so expect a small difference in the
+cached latents, and prefer tiling only where a whole frame does not fit. Frames whose height or width is
+not a multiple of 8 have the trailing pixels dropped, and the run says so in the log.
 
-`python tools/cosmos_tiled_vae_test.py` checks the geometry: that every frame is fully covered with no
-gaps, that tile edges stay stride-aligned and within the budget, and that for a linear encoder a tiled
-encode reproduces an untiled encode of the same frame.
+`python tools/cosmos_tiled_vae_test.py` checks the opt-in default, the tiling geometry (full coverage,
+stride-aligned edges, tiles within the budget) and that the blend weights sum to 1 on every latent cell.
 
 Cosmos-Predict2 supports LoRA and full fine tuning. Currently only for the t2i model variants.
 

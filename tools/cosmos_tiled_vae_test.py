@@ -1,12 +1,15 @@
-"""Standalone check for the smart tiled VAE encode in models/cosmos_predict2.py.
+"""Standalone check for the opt-in tiled VAE encode in utils/vae_tiling.py.
 
-The property that matters: tiling must be TRANSPARENT. The real encoder is
-nonlinear, so a fake one stands in - a linear, local, stride-8 encoder (average
-pool plus fixed channel weights). Such an encoder is exactly reproducible by
-encoding tiles and blending them, so if the blend weights are right the tiled
-result equals the untiled result. A seam that does not sum to weight 1 shows up
-here as a nonzero deviation instead of as a faint band in someone's training data
-months later.
+The property that matters: once the user turns tiling ON, it must be
+TRANSPARENT. The real encoder is nonlinear, so a fake one stands in - a linear,
+local, stride-8 encoder (average pool plus fixed channel weights). Such an
+encoder is exactly reproducible by encoding tiles and blending them, so if the
+blend weights are right the tiled result equals the untiled result. A seam that
+does not sum to weight 1 shows up here as a nonzero deviation instead of as a
+faint band in someone's training data months later.
+
+Tiling itself is off unless the config sets a positive [model].vae_max_area, so
+this check states its budget explicitly rather than reading a default.
 
 Run it with any interpreter that has torch:
 
@@ -15,10 +18,8 @@ Run it with any interpreter that has torch:
 Exits nonzero on the first failed invariant.
 """
 
-import ast
 import contextlib
 import io
-import math
 import pathlib
 import sys
 
@@ -29,30 +30,21 @@ except ModuleNotFoundError:
     sys.exit('this check needs torch; run it with the training interpreter')
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SOURCE = ROOT / 'models' / 'cosmos_predict2.py'
+sys.path.insert(0, str(ROOT))
 
-WANTED = {'plan_tiling_grid', 'get_tiling_indices_v2', 'axis_fade_lengths', 'vae_encode'}
-CONSTS = {'DEFAULT_VAE_MAX_AREA', 'DEFAULT_VAE_MIN_OVERLAP', 'VAE_SPATIAL_STRIDE', 'VAE_TILE_DIVISORS'}
+from utils.vae_tiling import (  # noqa: E402
+    DEFAULT_VAE_MIN_OVERLAP,
+    VAE_SPATIAL_STRIDE,
+    axis_fade_lengths,
+    get_tiling_indices_v2,
+    plan_tiling_grid,
+    resolve_vae_tiling,
+    vae_encode,
+)
 
-
-def load_tiling_code():
-    """Pull the tiling functions out of the model module.
-
-    The module itself imports transformers/accelerate and the VAE weights, which
-    this check has no use for, so the functions are lifted from the file instead
-    of imported. That also means the check exercises the bytes on disk.
-    """
-    tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
-    nodes = [n for n in tree.body
-             if (isinstance(n, ast.FunctionDef) and n.name in WANTED)
-             or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in CONSTS for t in n.targets))]
-    found = {n.name for n in nodes if isinstance(n, ast.FunctionDef)}
-    missing = WANTED - found
-    if missing:
-        sys.exit(f'{SOURCE} is missing the tiling code: {sorted(missing)}')
-    namespace = {'math': math, 'torch': torch}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), namespace)
-    return namespace
+# The budget a user would set for roughly 15 GB of VRAM; tiling is off by
+# default, so the value cannot come from a default any more.
+MAX_AREA = 1638400
 
 
 class FakeVaeModel:
@@ -78,21 +70,18 @@ class FakeVae:
 
 
 def main():
-    ns = load_tiling_code()
-    plan = ns['plan_tiling_grid']
-    indices = ns['get_tiling_indices_v2']
-    fades = ns['axis_fade_lengths']
-    vae_encode = ns['vae_encode']
     global STRIDE
-    STRIDE = ns['VAE_SPATIAL_STRIDE']
+    STRIDE = VAE_SPATIAL_STRIDE
 
-    max_area = ns['DEFAULT_VAE_MAX_AREA']
-    overlap = ns['DEFAULT_VAE_MIN_OVERLAP']
-    print(f'source: {SOURCE}')
+    max_area = MAX_AREA
+    overlap = DEFAULT_VAE_MIN_OVERLAP
+    print('module: utils/vae_tiling.py')
     print(f'tiling: max_area={max_area}px  min_overlap={overlap}px  stride={STRIDE}')
 
-    failures = check_geometry(plan, indices, fades, max_area, overlap)
-    failures += check_transparency(vae_encode, plan, max_area, overlap)
+    failures = check_opt_in_default(max_area, overlap)
+    failures += check_geometry(plan_tiling_grid, get_tiling_indices_v2,
+                               axis_fade_lengths, max_area, overlap)
+    failures += check_transparency(vae_encode, plan_tiling_grid, max_area, overlap)
 
     print()
     if failures:
@@ -102,6 +91,30 @@ def main():
         return 1
     print('OK: tiling is transparent, no seams')
     return 0
+
+
+def check_opt_in_default(max_area, overlap):
+    """Tiling must stay off until the user asks for it."""
+    print()
+    print('opt-in default')
+    failures = []
+    cases = [
+        ({}, 0),
+        ({'vae_min_overlap': 64}, 0),
+        ({'vae_max_area': 0}, 0),
+        ({'vae_max_area': -1}, 0),
+        ({'vae_max_area': max_area}, max_area),
+    ]
+    for config, want in cases:
+        got, got_overlap = resolve_vae_tiling(config)
+        if got != want:
+            failures.append(f'{config} -> max_area {got}, expected {want}')
+        if config.get('vae_min_overlap', overlap) != got_overlap:
+            failures.append(f'{config} -> min_overlap {got_overlap}')
+        print(f'  {str(config):<40} max_area={got}  min_overlap={got_overlap}')
+    if not failures:
+        print('  no config tiles; a positive vae_max_area is the only way in')
+    return failures
 
 
 def check_geometry(plan, indices, fades, max_area, overlap):
