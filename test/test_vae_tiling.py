@@ -348,6 +348,29 @@ def test_a_frame_under_budget_plans_a_single_tile():
 # the wiring: the model module must read the opt-in, not carry its own default
 # --------------------------------------------------------------------------
 
+def test_the_user_table_reaches_vae_encode_through_the_caching_chain():
+    """The [model] table the user writes is the one vae_encode is configured from.
+
+    A default that is off in utils/vae_tiling.py is worthless if the pipeline
+    reads its area from somewhere else, so the whole seam is pinned: the [model]
+    table becomes self.model_config, the knobs are resolved from it, the encode
+    closure gets them, and the caching path takes that closure.
+    """
+    root = Path(__file__).resolve().parent.parent
+    model = (root / 'models' / 'cosmos_predict2.py').read_text(encoding='utf-8')
+    dataset = (root / 'utils' / 'dataset.py').read_text(encoding='utf-8')
+    train = (root / 'train.py').read_text(encoding='utf-8')
+
+    assert "model_config = config['model']" in train, 'config[model] is the [model] table'
+    assert "self.model_config = self.config['model']" in model
+    assert 'resolve_vae_tiling(self.model_config)' in model, (
+        'the pipeline must resolve the tiling knobs from the user table')
+    assert ('vae_encode(tensor, self.vae, self.vae_max_area, self.vae_min_overlap)'
+            in model), 'the encode closure must pass the resolved knobs through'
+    assert 'self.model.get_call_vae_fn(self.vae)' in dataset, (
+        'the caching path must take the closure that configures the encode')
+
+
 def test_the_model_module_reads_the_opt_in_instead_of_a_local_default():
     source = (Path(__file__).resolve().parent.parent / 'models' / 'cosmos_predict2.py').read_text(
         encoding='utf-8')
