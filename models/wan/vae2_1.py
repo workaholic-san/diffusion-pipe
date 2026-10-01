@@ -22,6 +22,23 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
+        if cache_x is None and self._padding[4] > 0 and x.shape[2] == 1:
+            # A single frame with no frame cache. The temporal padding only ever
+            # prepends zeros, so hand the padding to the convolution itself and
+            # drop the two weight taps that could only multiply those zeros:
+            # w0*0 + w1*0 + w2*x0 == w2*x0 exactly in IEEE arithmetic. Identical
+            # result, without materialising a padded copy of the whole
+            # activation. The cached (T>1) path below is untouched.
+            pad_w, pad_h = self._padding[0], self._padding[2]
+            return F.conv3d(
+                x,
+                self.weight[:, :, -1:, :, :],
+                self.bias,
+                self.stride,
+                (0, pad_h, pad_w),
+                self.dilation,
+                self.groups)
+
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -514,18 +531,24 @@ class WanVAE_(nn.Module):
         ## cache
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
+        # A single chunk can never read the cache: the loop below runs exactly
+        # once and clear_cache() discards whatever was written. Passing None is
+        # therefore equivalent by construction, and it is what lets
+        # CausalConv3d take its no-cache fast path instead of cloning the whole
+        # activation once per convolution. Multi-chunk video is unaffected.
+        feat_map = self._enc_feat_map if iter_ > 1 else None
         ## 对encode输入的x，按时间拆分为1、4、4、4....
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
                 out = self.encoder(
                     x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=feat_map,
                     feat_idx=self._enc_conv_idx)
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=feat_map,
                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
         mu, log_var = self.conv1(out).chunk(2, dim=1)
